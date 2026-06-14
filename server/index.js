@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const mongoose = require('mongoose');
 const path = require('path');
 const dotenv = require('dotenv');
+const Jimp = require('jimp');
 
 const envPath = path.join(__dirname, '.env');
 const exampleEnvPath = path.join(__dirname, '.env.example');
@@ -18,19 +19,18 @@ const FileMetadata = require('./models/FileMetadata');
 const Message = require('./models/Message');
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: true, methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
+app.options('*', cors());
 app.use(express.json());
+
+const http = require('http');
+const { Server } = require('socket.io');
+let io; // initialized after server created
 
 const upload = multer({ storage: multer.memoryStorage() });
 
 const PORT = process.env.PORT || 5000;
 const MONGO_URI = process.env.MONGO_URI;
-
-const SALT_SIZE = 16;
-const IV_SIZE = 16;
-const KEY_SIZE = 32;
-const PBKDF2_ITERATIONS = 100000;
-const ALGORITHM = 'aes-256-cbc';
 
 async function connectDatabase() {
   if (!MONGO_URI) {
@@ -47,30 +47,146 @@ async function connectDatabase() {
   }
 }
 
-function deriveKey(password, salt) {
-  return crypto.pbkdf2Sync(password, salt, PBKDF2_ITERATIONS, KEY_SIZE, 'sha256');
+function gfMultiply(a, b) {
+  let product = 0;
+  for (let i = 0; i < 8; i++) {
+    if (b & 1) {
+      product ^= a;
+    }
+    const hiBit = a & 0x80;
+    a = (a << 1) & 0xff;
+    if (hiBit) {
+      a ^= 0x1b;
+    }
+    b >>= 1;
+  }
+  return product;
 }
 
-function encryptBuffer(buffer, password) {
-  const salt = crypto.randomBytes(SALT_SIZE);
-  const iv = crypto.randomBytes(IV_SIZE);
-  const key = deriveKey(password, salt);
-  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
-  const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()]);
-  return Buffer.concat([salt, iv, encrypted]);
+function gfInverse(byte) {
+  if (byte === 0) {
+    return 0;
+  }
+  for (let candidate = 1; candidate < 256; candidate++) {
+    if (gfMultiply(byte, candidate) === 1) {
+      return candidate;
+    }
+  }
+  return 0;
 }
 
-function decryptBuffer(buffer, password) {
-  if (buffer.length < SALT_SIZE + IV_SIZE) {
-    throw new Error('Encrypted file is corrupted or invalid.');
+function affineTransform(value) {
+  let result = 0;
+  for (let i = 0; i < 8; i++) {
+    const bit = ((value >> i) & 1) ^
+      ((value >> ((i + 4) % 8)) & 1) ^
+      ((value >> ((i + 5) % 8)) & 1) ^
+      ((value >> ((i + 6) % 8)) & 1) ^
+      ((value >> ((i + 7) % 8)) & 1) ^
+      ((0x63 >> i) & 1);
+    result |= bit << i;
+  }
+  return result;
+}
+
+function buildAesSBox() {
+  const sbox = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    const inv = gfInverse(i);
+    sbox[i] = affineTransform(inv);
+  }
+  return sbox;
+}
+
+function buildInverseSBox(sbox) {
+  const invSbox = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    invSbox[sbox[i]] = i;
+  }
+  return invSbox;
+}
+
+function deriveChaoticSeed(password) {
+  const hash = crypto.createHash('sha256').update(password).digest();
+  const value = hash.readUInt32BE(0) / 0xffffffff;
+  return 0.1 + value * 0.8;
+}
+
+function buildPermutation(length, seed) {
+  const items = new Array(length);
+  let x = seed;
+  items[0] = { value: x, index: 0 };
+  for (let i = 1; i < length; i++) {
+    x = 3.99 * x * (1 - x);
+    items[i] = { value: x, index: i };
+  }
+  items.sort((a, b) => a.value - b.value);
+  return items.map((item) => item.index);
+}
+
+function extractGrayscalePixels(image) {
+  const { width, height, data } = image.bitmap;
+  const pixels = new Uint8Array(width * height);
+  let writeIndex = 0;
+  for (let readIndex = 0; readIndex < data.length; readIndex += 4) {
+    pixels[writeIndex++] = data[readIndex];
+  }
+  return { pixels, width, height };
+}
+
+async function createImageFromPixels(pixels, width, height) {
+  const image = await Jimp.create(width, height);
+  let writeIndex = 0;
+  for (let i = 0; i < pixels.length; i++) {
+    const value = pixels[i];
+    image.bitmap.data[writeIndex++] = value;
+    image.bitmap.data[writeIndex++] = value;
+    image.bitmap.data[writeIndex++] = value;
+    image.bitmap.data[writeIndex++] = 255;
+  }
+  return image;
+}
+
+const AES_SBOX = buildAesSBox();
+const AES_INV_SBOX = buildInverseSBox(AES_SBOX);
+
+async function encryptImageBuffer(buffer, password) {
+  const image = await Jimp.read(buffer);
+  image.grayscale();
+  const { pixels, width, height } = extractGrayscalePixels(image);
+
+  const substituted = new Uint8Array(pixels.length);
+  for (let i = 0; i < pixels.length; i++) {
+    substituted[i] = AES_SBOX[pixels[i]];
   }
 
-  const salt = buffer.slice(0, SALT_SIZE);
-  const iv = buffer.slice(SALT_SIZE, SALT_SIZE + IV_SIZE);
-  const ciphertext = buffer.slice(SALT_SIZE + IV_SIZE);
-  const key = deriveKey(password, salt);
-  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
-  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  const permutation = buildPermutation(pixels.length, deriveChaoticSeed(password));
+  const permuted = new Uint8Array(pixels.length);
+  for (let i = 0; i < pixels.length; i++) {
+    permuted[i] = substituted[permutation[i]];
+  }
+
+  const encryptedImage = await createImageFromPixels(permuted, width, height);
+  return encryptedImage.getBufferAsync(Jimp.MIME_PNG);
+}
+
+async function decryptImageBuffer(buffer, password) {
+  const image = await Jimp.read(buffer);
+  const { pixels, width, height } = extractGrayscalePixels(image);
+
+  const permutation = buildPermutation(pixels.length, deriveChaoticSeed(password));
+  const recoveredSub = new Uint8Array(pixels.length);
+  for (let i = 0; i < pixels.length; i++) {
+    recoveredSub[permutation[i]] = pixels[i];
+  }
+
+  const recovered = new Uint8Array(pixels.length);
+  for (let i = 0; i < pixels.length; i++) {
+    recovered[i] = AES_INV_SBOX[recoveredSub[i]];
+  }
+
+  const decryptedImage = await createImageFromPixels(recovered, width, height);
+  return decryptedImage.getBufferAsync(Jimp.MIME_PNG);
 }
 
 app.post('/api/encrypt', upload.single('image'), async (req, res) => {
@@ -85,7 +201,7 @@ app.post('/api/encrypt', upload.single('image'), async (req, res) => {
       return res.status(400).json({ message: 'A password of at least 4 characters is required.' });
     }
 
-    const encryptedBuffer = encryptBuffer(file.buffer, password);
+    const encryptedBuffer = await encryptImageBuffer(file.buffer, password);
 
     await FileMetadata.create({
       fileName: file.originalname,
@@ -95,8 +211,8 @@ app.post('/api/encrypt', upload.single('image'), async (req, res) => {
     }).catch(() => {});
 
     res.set({
-      'Content-Type': 'application/octet-stream',
-      'Content-Disposition': `attachment; filename="${path.parse(file.originalname).name}.enc"`,
+      'Content-Type': 'image/png',
+      'Content-Disposition': `attachment; filename="${path.parse(file.originalname).name}_encrypted.png"`,
     });
     res.send(encryptedBuffer);
   } catch (error) {
@@ -117,7 +233,7 @@ app.post('/api/decrypt', upload.single('encryptedFile'), async (req, res) => {
       return res.status(400).json({ message: 'A password of at least 4 characters is required.' });
     }
 
-    const decryptedBuffer = decryptBuffer(file.buffer, password);
+    const decryptedBuffer = await decryptImageBuffer(file.buffer, password);
 
     await FileMetadata.create({
       fileName: file.originalname,
@@ -127,7 +243,7 @@ app.post('/api/decrypt', upload.single('encryptedFile'), async (req, res) => {
     }).catch(() => {});
 
     res.set({
-      'Content-Type': 'application/octet-stream',
+      'Content-Type': 'image/png',
       'Content-Disposition': `attachment; filename="${path.parse(file.originalname).name}_decrypted.png"`,
     });
     res.send(decryptedBuffer);
@@ -152,7 +268,7 @@ app.post('/api/messages/send', upload.single('image'), async (req, res) => {
       return res.status(400).json({ message: 'A password of at least 4 characters is required.' });
     }
 
-    const encryptedBuffer = encryptBuffer(file.buffer, password);
+    const encryptedBuffer = await encryptImageBuffer(file.buffer, password);
 
     const message = await Message.create({
       sender,
@@ -171,10 +287,42 @@ app.post('/api/messages/send', upload.single('image'), async (req, res) => {
       createdAt: new Date(),
     }).catch(() => {});
 
+    // Emit real-time notification to receiver if socket.io is available
+    try {
+      if (io) {
+        io.to(receiver).emit('new_message', {
+          _id: message._id,
+          sender,
+          originalName: message.originalName,
+          createdAt: message.createdAt,
+        });
+      }
+    } catch (e) {
+      console.warn('Failed to emit socket event', e.message);
+    }
+
     res.json({ message: 'Encrypted message sent successfully.', messageId: message._id });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Failed to send encrypted message.', error: error.message });
+  }
+});
+
+app.get('/api/messages/:messageId/encrypted', async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ message: 'Message not found.' });
+    }
+    res.set({
+      'Content-Type': 'image/png',
+      'Content-Disposition': `inline; filename="${path.parse(message.originalName).name}_encrypted.png"`,
+    });
+    res.send(message.encryptedData);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Failed to load encrypted preview.', error: error.message });
   }
 });
 
@@ -210,13 +358,13 @@ app.post('/api/messages/:messageId/decrypt', async (req, res) => {
       return res.status(404).json({ message: 'Message not found.' });
     }
 
-    const decryptedBuffer = decryptBuffer(message.encryptedData, password);
+    const decryptedBuffer = await decryptImageBuffer(message.encryptedData, password);
     message.isRead = true;
     await message.save();
 
     res.set({
-      'Content-Type': 'application/octet-stream',
-      'Content-Disposition': `attachment; filename="${path.parse(message.originalName).name}_decrypted${path.extname(message.originalName) || '.png'}"`,
+      'Content-Type': 'image/png',
+      'Content-Disposition': `inline; filename="${path.parse(message.originalName).name}_decrypted${path.extname(message.originalName) || '.png'}"`,
     });
     res.send(decryptedBuffer);
   } catch (error) {
@@ -230,7 +378,30 @@ app.get('/api/health', (req, res) => {
 });
 
 connectDatabase().then(() => {
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = http.createServer(app);
+  io = new Server(server, {
+    path: '/socket.io',
+    cors: {
+      origin: true,
+      methods: ['GET', 'POST', 'OPTIONS'],
+      credentials: true,
+    },
+  });
+
+  io.on('connection', (socket) => {
+    console.log('Socket connected:', socket.id);
+    socket.on('identify', (username) => {
+      if (username) {
+        socket.join(username);
+        console.log('Socket', socket.id, 'joined', username);
+      }
+    });
+    socket.on('disconnect', () => {
+      // no-op
+    });
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 });

@@ -46,7 +46,7 @@ cd server
 npm run dev
 ```
 
-Then start the frontend:
+Then start the frontend locally:
 
 ```bash
 cd ../client
@@ -54,6 +54,23 @@ npm run dev
 ```
 
 Open the URL shown by Vite (typically `http://localhost:3000`).
+
+## Production deployment
+
+When deploying the frontend to AWS S3, the static site can no longer use the Vite `/api` proxy. Set the backend URL in the frontend build with:
+
+```bash
+cd client
+copy .env.example .env
+```
+
+Then edit `client/.env` and set:
+
+```text
+VITE_API_BASE_URL=https://your-ec2-backend-host:5000
+```
+
+Build the client and deploy the generated `dist/` folder to S3.
 
 ## Usage
 1. Choose a sender and a receiver.
